@@ -5,8 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PG_VERSION=17
 
 # Base dependencies + pgEdge apt repository
-# (build-essential + git are only for compiling the `prefix` extension below;
-#  cmake/libssl-dev were only needed by the removed TimescaleDB build.)
+# Build tools compile TimescaleDB, prefix and set_user against pgEdge.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl gnupg2 lsb-release ca-certificates \
     build-essential git cmake libssl-dev \

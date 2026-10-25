@@ -6,9 +6,9 @@ pgEdge multi-master PostgreSQL 17 cluster for VoIP infrastructure. Provides Spoc
 
 ## Backup ownership
 
-Mothership owns Ofelia and scheduled database backups. This repository does not
-start a backup scheduler. Manual dump and restore commands remain available for
-local development. PgCat and the second database node are optional (`multi` profile).
+Mothership owns Ofelia and scheduled database backups. The database image contains no scheduler. Ofelia runs only in the `ci`
+Compose profile for backup testing. Manual dump and restore commands remain available for
+local development. PgCat and the second database node are optional (`ci` profile).
 
 ## Architecture
 
@@ -48,7 +48,7 @@ The image is built from Ubuntu 24.04 and includes:
 - Exposes port 5432 (PostgreSQL)
 
 ```bash
-# Pull from Docker Hub
+# Pull from GHCR
 docker pull ghcr.io/voipappz/db:pgedge
 
 # Or build locally
@@ -256,7 +256,7 @@ Additional fixed settings (in `init-node.sh`):
 
 ## CI Pipeline
 
-CircleCI runs on every push to `master`, `main`, and `edge`:
+GitHub Actions runs checks on pull requests and main pushes; main publishes only after all checks pass:
 
 1. **build** — Build image, verify PostgreSQL 17, extensions (spock, prefix, pgaudit), init scripts
 2. **test** — Single-node verification:
@@ -275,7 +275,7 @@ CircleCI runs on every push to `master`, `main`, and `edge`:
 
 ```
 .
-├── .circleci/config.yml    # CI pipeline (build, test, test-multi-node, push)
+├── .github/workflows/image.yml # GitHub Actions checks and GHCR publishing
 ├── Dockerfile              # Image: Ubuntu 24.04 + pgEdge PG 17 + prefix
 ├── docker-compose.yml      # Two-node cluster + pgcat, with health checks
 ├── init-node.sh            # Entrypoint: PG cluster, DB init, CIS config, Spock replication
@@ -287,7 +287,7 @@ CircleCI runs on every push to `master`, `main`, and `edge`:
     └── voipappz.sql        # Extensions only (ALL tables are managed by app migrations)
 ```
 
-GHCR publishing in CircleCI requires `GHCR_USERNAME` and `GHCR_TOKEN` with package write access.
+GHCR publishing uses the repository GITHUB_TOKEN.
 
 GitHub Actions builds and runs the existing single-node and replication checks before
 publishing `ghcr.io/voipappz/db:pgedge`, `:latest`, and `:sha-<commit>` on main.

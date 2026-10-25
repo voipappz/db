@@ -34,3 +34,6 @@ reports/
 sql/freeswitch.sql
 sql/kamailio.sql
 sql/kong.sql
+
+# Legacy CI configuration kept locally; GitHub Actions is canonical
+.circleci/
