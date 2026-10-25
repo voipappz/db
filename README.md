@@ -193,6 +193,17 @@ N1_PEER_HOST=db2.example.com docker compose up pgedge-n1
 N2_PEER_HOST=db1.example.com docker compose up pgedge-n2
 ```
 
+### Upgrading a running node
+
+Swap the image tag and recreate the container; the data and config volumes
+stay. `postgresql.conf` is written once, on a fresh config volume, so a node
+that booted before TimescaleDB joined this image carries an old
+`shared_preload_libraries`. `init-node.sh` rewrites that one line on every boot
+when it differs from what the image wants (and logs `Updating
+shared_preload_libraries`), so `CREATE EXTENSION timescaledb` works after the
+restart without touching the volume by hand. CI's **test** job proves this by
+planting the old line and restarting the same container.
+
 ### Security
 
 - **Passwords**: From the `POSTGRES_PASSWORD` environment variable only — never baked into the image, and no secret file on disk
@@ -264,6 +275,8 @@ GitHub Actions runs checks on pull requests and main pushes; main publishes only
    - Extensions (hstore, uuid-ossp, prefix, spock)
    - CIS logging/audit settings; event_store_events is NOT seeded
    - Dump/restore round-trip (custom, tar, SQL, schema-only, data-only)
+   - An existing config volume gets TimescaleDB preloaded on restart (upgrade path)
+   - TimescaleDB hypertable smoke check beside Spock
 3. **test-multi-node** — Two-node verification:
    - Spock bidirectional replication (n1 -> n2, n2 -> n1)
    - Security (SCRAM-SHA-256, pg_hba restrictions, no secrets in image)
