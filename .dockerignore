@@ -1,0 +1,45 @@
+# Secrets - never include in Docker build context
+secrets/
+.env
+.env.*
+
+# Git
+.git/
+.gitignore
+.dockerignore
+
+# CI/CD
+.circleci/
+
+# Config files not needed in image
+cluster.yaml
+db.json
+docker-compose.yml
+Makefile
+
+# Docs
+*.md
+LICENSE
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data and generated artifacts
+backups/
+backups-remote/
+ofelia-logs/
+reports/
+*.dump
+*.secret
+
+.github/
+
+# Legacy local SQL files are not part of this release
+sql/freeswitch.sql
+sql/kamailio.sql
+sql/kong.sql

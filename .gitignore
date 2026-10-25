@@ -1,0 +1,36 @@
+# Secrets - never commit
+secrets/
+*.secret
+.env
+.env.*
+!.env.example
+
+# Backups
+backups/
+backups-remote/
+
+# ofelia failure logs (contain the job environment)
+ofelia-logs/
+
+# Generated customer security evidence (may describe deployment topology)
+reports/cis-postgresql-17/
+reports/customer/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Local topology and legacy agent notes
+db.json
+CLAUDE.md
+reports/
+*.dump
+
+# Legacy local SQL files are not part of this release
+sql/freeswitch.sql
+sql/kamailio.sql
+sql/kong.sql

@@ -1,0 +1,242 @@
+# pgEdge Multi-Master: EU1 (n1) + EU2 (n2)
+# Local testing setup - both nodes on one machine.
+#
+# Configuration: run `make setup` (copies .env.example → .env and generates
+# POSTGRES_PASSWORD), then adjust values. POSTGRES_PASSWORD is the one setting
+# with no default — everything else works out of the box.
+#
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f
+#
+# Production: run one node per host with real hostnames/IPs.
+
+networks:
+  default:
+    name: pgedge-net
+
+volumes:
+  pgedge_n1_data:
+  pgedge_n2_data:
+
+x-common-env: &common-env
+  # The only password source. No docker secret file — `make setup` writes a
+  # generated POSTGRES_PASSWORD into .env; compose refuses to start without it
+  # rather than booting a cluster nothing can authenticate against.
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (run 'make setup')}
+  DB_USER: ${DB_USER:-postgres}
+  DATABASES: ${DATABASES:-voipappz}
+  # Databases replicated active-active between the nodes. The API's
+  # rake db:migrate tables have to reach the peer.
+  SPOCK_DATABASES: ${SPOCK_DATABASES:-voipappz}
+  PEER_PORT: ${PEER_PORT:-5432}
+  PG_MAX_CONNECTIONS: ${PG_MAX_CONNECTIONS:-250}
+  PG_SHARED_BUFFERS: ${PG_SHARED_BUFFERS:-1GB}
+  PG_EFFECTIVE_CACHE_SIZE: ${PG_EFFECTIVE_CACHE_SIZE:-12GB}
+  PG_WORK_MEM: ${PG_WORK_MEM:-20971kB}
+  PG_MAINTENANCE_WORK_MEM: ${PG_MAINTENANCE_WORK_MEM:-512MB}
+  PG_EFFECTIVE_IO_CONCURRENCY: ${PG_EFFECTIVE_IO_CONCURRENCY:-200}
+  PG_RANDOM_PAGE_COST: ${PG_RANDOM_PAGE_COST:-1.1}
+  PG_WAL_BUFFERS: ${PG_WAL_BUFFERS:-16MB}
+  # CIS benchmark knobs — defaults live in init-node.sh, see .env.example
+  PG_LOG_DESTINATION: ${PG_LOG_DESTINATION:-stderr}
+  PG_LOGGING_COLLECTOR: ${PG_LOGGING_COLLECTOR:-off}
+  PG_LOG_STATEMENT: ${PG_LOG_STATEMENT:-ddl}
+  PG_LOG_MIN_MESSAGES: ${PG_LOG_MIN_MESSAGES:-warning}
+  PG_LOG_MIN_ERROR_STATEMENT: ${PG_LOG_MIN_ERROR_STATEMENT:-error}
+  PG_LOG_ERROR_VERBOSITY: ${PG_LOG_ERROR_VERBOSITY:-default}
+  PG_LOG_LINE_PREFIX: "${PG_LOG_LINE_PREFIX:-%m [%p]: [%l-1] db=%d,user=%u,app=%a,client=%h }"
+  PG_LOG_TIMEZONE: ${PG_LOG_TIMEZONE:-UTC}
+  PG_TIMEZONE: ${PG_TIMEZONE:-UTC}
+  PG_LOG_MIN_DURATION_STATEMENT: ${PG_LOG_MIN_DURATION_STATEMENT:-1000}
+  PG_LOG_CONNECTIONS: ${PG_LOG_CONNECTIONS:-on}
+  PG_LOG_DISCONNECTIONS: ${PG_LOG_DISCONNECTIONS:-on}
+  PG_LOG_HOSTNAME: ${PG_LOG_HOSTNAME:-off}
+  PG_LOG_REPLICATION_COMMANDS: ${PG_LOG_REPLICATION_COMMANDS:-on}
+  PG_SYSLOG_FACILITY: ${PG_SYSLOG_FACILITY:-LOCAL0}
+  PG_SYSLOG_IDENT: ${PG_SYSLOG_IDENT:-postgres}
+  PG_PGAUDIT_LOG: ${PG_PGAUDIT_LOG:-ddl,role}
+  PG_PGAUDIT_LOG_CATALOG: ${PG_PGAUDIT_LOG_CATALOG:-off}
+  PG_PGAUDIT_LOG_PARAMETER: ${PG_PGAUDIT_LOG_PARAMETER:-on}
+  PG_PGAUDIT_LOG_RELATION: ${PG_PGAUDIT_LOG_RELATION:-on}
+  PG_PGAUDIT_LOG_STATEMENT_ONCE: ${PG_PGAUDIT_LOG_STATEMENT_ONCE:-off}
+  PG_PASSWORDCHECK: ${PG_PASSWORDCHECK:-on}
+  PG_SET_USER: ${PG_SET_USER:-off}
+  PG_PGCRYPTO: ${PG_PGCRYPTO:-off}
+  PG_REVOKE_PUBLIC_CREATE: ${PG_REVOKE_PUBLIC_CREATE:-off}
+  PG_REVOKE_FUNCTION_PRIVS: ${PG_REVOKE_FUNCTION_PRIVS:-off}
+  PG_ROW_SECURITY: ${PG_ROW_SECURITY:-on}
+  PG_MONITOR_USER: ${PG_MONITOR_USER:-monitor}
+  PG_MONITOR_PASSWORD: ${PG_MONITOR_PASSWORD:-}
+  PG_REPLICATION_USER: ${PG_REPLICATION_USER:-replicator}
+  PG_REPLICATION_PASSWORD: ${PG_REPLICATION_PASSWORD:-}
+  PG_MAX_WORKER_PROCESSES: ${PG_MAX_WORKER_PROCESSES:-10}
+  PG_MAX_WAL_SENDERS: ${PG_MAX_WAL_SENDERS:-10}
+  PG_MAX_REPLICATION_SLOTS: ${PG_MAX_REPLICATION_SLOTS:-10}
+  PG_ARCHIVE_MODE: ${PG_ARCHIVE_MODE:-off}
+  PG_ARCHIVE_COMMAND: ${PG_ARCHIVE_COMMAND:-}
+  PG_TLS: ${PG_TLS:-off}
+  PG_TLS_MIN_PROTOCOL: ${PG_TLS_MIN_PROTOCOL:-TLSv1.2}
+
+services:
+  pgedge-n1:
+    image: ghcr.io/voipappz/db:pgedge
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pgedge-n1
+    hostname: pgedge-n1
+    environment:
+      <<: *common-env
+      NODE_NAME: ${N1_NODE_NAME:-n1}
+      PEER_NAME: ${N1_PEER_NAME:-n2}
+      PEER_HOST: ${N1_PEER_HOST:-pgedge-n2}
+    ports:
+      - "127.0.0.1:${N1_PG_PORT:-5432}:5432"
+    volumes:
+      - pgedge_n1_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # pgcat — pooling AND load balancing over both active-active nodes, the
+  # same layer production uses (../cli). One endpoint that mimics two
+  # machines: client → pgcat (127.0.0.1:5435) → n1/n2 round-robin.
+  pgedge-pgcat:
+    # Second node, and the pooler that load-balances across the pair, are opt-in.
+    # A VoIPAppz install runs ONE postgres -- init-node.sh keys standalone off
+    # PEER_NAME=none and never creates a subscription -- so two nodes are a test
+    # rig for proving Spock replication before an image ships, not a default.
+    #
+    #   docker compose up -d                    # one server
+    #   docker compose --profile ci up -d    # the two-node rig
+    #
+    # Defaulting to the rig also meant the pair held host ports 5432/5433, which
+    # are exactly what a VoIPAppz stack publishes -- so the two could not run on
+    # one machine.
+    profiles: ["ci"]
+    image: ghcr.io/postgresml/pgcat:latest
+    container_name: pgedge-pgcat
+    hostname: pgedge-pgcat
+    ports:
+      - "127.0.0.1:${PGCAT_PORT:-5435}:5432"
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (run 'make setup')}
+      # The entrypoint maps the PostgreSQL on/off convention to TOML true/false.
+      PG_TLS: ${PG_TLS:-off}
+    volumes:
+      # Template: the entrypoint substitutes $POSTGRES_PASSWORD from the
+      # environment at boot (pgcat can't expand env vars in TOML itself).
+      - ./pgcat.toml:/etc/pgcat/pgcat.toml.tpl:ro
+    entrypoint:
+      - sh
+      - -c
+      - |
+        if [ "$$PG_TLS" = "on" ]; then PGCAT_SERVER_TLS=true; else PGCAT_SERVER_TLS=false; fi
+        sed -e "s|\$${POSTGRES_PASSWORD}|$$POSTGRES_PASSWORD|g" \
+            -e "s|\$${PGCAT_SERVER_TLS}|$$PGCAT_SERVER_TLS|g" \
+            /etc/pgcat/pgcat.toml.tpl > /tmp/pgcat.toml
+        exec pgcat /tmp/pgcat.toml
+    depends_on:
+      - pgedge-n1
+      - pgedge-n2
+    # No nc/curl in this image — check the listening socket directly.
+    # 1538 = 5432 hex, 0A = LISTEN.
+    healthcheck:
+      test: ["CMD-SHELL", "grep -qi ':1538 .* 0A ' /proc/net/tcp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ofelia — docker-native cron. Jobs are declared as labels below; each run
+  # starts a throwaway stock-libpq client that pg_dumps n1 into BACKUP_DIR on
+  # the host, then prunes dumps older than BACKUP_KEEP_DAYS.
+  #
+  # BACKUP_SCHEDULE is 6-field cron (seconds first) or @every 1h / @daily.
+  pgedge-ofelia:
+    profiles: ["ci"]
+    image: mcuadros/ofelia:latest
+    container_name: pgedge-ofelia
+    command: daemon --docker
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${OFELIA_LOG_DIR:-./ofelia-logs}:/logs
+    labels:
+      # Failed runs land in OFELIA_LOG_DIR as <date>_<job>.{json,stderr.log}.
+      # An empty folder means every run since boot succeeded —
+      # `make backup-status` reads it. Kept OUT of BACKUP_DIR on purpose: the
+      # .json ofelia writes contains the job's full environment, password
+      # included, and must not travel with the dumps to offsite storage.
+      # Set OFELIA_SLACK_WEBHOOK to also get alerts; the middleware stays
+      # inert while it is empty.
+      ofelia.save-folder: "/logs"
+      ofelia.save-only-on-error: "true"
+      ofelia.slack-webhook: "${OFELIA_SLACK_WEBHOOK:-}"
+      ofelia.slack-only-on-error: "true"
+      ofelia.job-run.pg-backup.schedule: "${BACKUP_SCHEDULE:-0 0 3 * * *}"
+      ofelia.job-run.pg-backup.image: "postgres:17-alpine"
+      ofelia.job-run.pg-backup.network: "pgedge-net"
+      ofelia.job-run.pg-backup.volume: "${BACKUP_DIR:?set BACKUP_DIR in .env (run 'make setup')}:/backups"
+      ofelia.job-run.pg-backup.delete: "true"
+      ofelia.job-run.pg-backup.environment: '["PGPASSWORD=${POSTGRES_PASSWORD}","DATABASES=${DATABASES:-voipappz}","BACKUP_KEEP_DAYS=${BACKUP_KEEP_DAYS:-7}"]'
+      # -N spock: dumps must not carry replication metadata.
+      # Dump to .part and rename only on success: a plain redirect creates the
+      # file before pg_dump runs, so a failed run would leave a 0-byte dump
+      # sitting there looking like the newest good backup.
+      ofelia.job-run.pg-backup.command: >-
+        sh -c "set -e;
+        rm -f /backups/*.dump.part;
+        TS=$$(date +%Y%m%d-%H%M%S);
+        for db in $$DATABASES; do
+        pg_dump -h pgedge-n1 -U postgres -Fc -N spock $$db > /backups/$$db-$$TS.dump.part;
+        mv /backups/$$db-$$TS.dump.part /backups/$$db-$$TS.dump;
+        echo \"backed up $$db to $$db-$$TS.dump\";
+        done;
+        find /backups -name '*.dump' -mtime +$$BACKUP_KEEP_DAYS -delete"
+    depends_on:
+      - pgedge-n1
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep ofelia >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  pgedge-n2:
+    # Second node, and the pooler that load-balances across the pair, are opt-in.
+    # A VoIPAppz install runs ONE postgres -- init-node.sh keys standalone off
+    # PEER_NAME=none and never creates a subscription -- so two nodes are a test
+    # rig for proving Spock replication before an image ships, not a default.
+    #
+    #   docker compose up -d                    # one server
+    #   docker compose --profile ci up -d    # the two-node rig
+    #
+    # Defaulting to the rig also meant the pair held host ports 5432/5433, which
+    # are exactly what a VoIPAppz stack publishes -- so the two could not run on
+    # one machine.
+    profiles: ["ci"]
+    image: ghcr.io/voipappz/db:pgedge
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pgedge-n2
+    hostname: pgedge-n2
+    environment:
+      <<: *common-env
+      NODE_NAME: ${N2_NODE_NAME:-n2}
+      PEER_NAME: ${N2_PEER_NAME:-n1}
+      PEER_HOST: ${N2_PEER_HOST:-pgedge-n1}
+    ports:
+      - "127.0.0.1:${N2_PG_PORT:-5433}:5432"
+    volumes:
+      - pgedge_n2_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped

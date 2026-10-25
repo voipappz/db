@@ -1,0 +1,704 @@
+name: Database image
+on:
+  push:
+    branches:
+      - main
+  pull_request: {}
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: db-image-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and verify image
+        run: |
+          docker build -t ghcr.io/voipappz/db:pgedge .
+          docker run --rm --entrypoint bash ghcr.io/voipappz/db:pgedge -c \
+            'pg_config --version && \
+             ls /usr/share/postgresql/*/extension/ | grep -E "prefix|spock" && \
+             test -x /home/pgedge/scripts/init-node.sh && \
+             ls /home/pgedge/scripts/sql/ && \
+             echo "Image OK"'
+      - uses: docker/setup-buildx-action@v3
+      - name: Export verified build
+        run: docker save ghcr.io/voipappz/db:pgedge -o /tmp/db-image.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: db-image
+          path: /tmp/db-image.tar
+          retention-days: 1
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: db-image
+          path: /tmp
+      - name: Load candidate image
+        run: docker load -i /tmp/db-image.tar
+      - name: Start single node
+        run: |
+          docker run -d --name pgedge-test \
+            -e NODE_NAME=test -e PEER_NAME=none -e PEER_HOST=localhost \
+            -e DB_USER=postgres -e POSTGRES_PASSWORD=testpassword123 \
+            ghcr.io/voipappz/db:pgedge
+      - name: Wait for ready
+        run: |
+          for i in $(seq 1 90); do
+            docker exec pgedge-test test -f /tmp/init-complete 2>/dev/null && echo "Ready after ${i}s" && exit 0
+            sleep 1
+          done
+          docker logs pgedge-test && exit 1
+      - name: Verify databases
+        run: |
+          docker exec pgedge-test psql -U postgres -t -A -c \
+            "SELECT 1 FROM pg_database WHERE datname='voipappz';" | grep -q 1
+          echo "  voipappz: OK"
+
+          # voipappz is the only database this image provisions.
+          for db in freeswitch kamailio kong; do
+            COUNT=$(docker exec pgedge-test psql -U postgres -t -A -c \
+              "SELECT count(*) FROM pg_database WHERE datname='${db}';")
+            [ "$COUNT" = "0" ] || { echo "FAIL: ${db} should not exist"; exit 1; }
+            echo "  ${db} absent: OK"
+          done
+
+          # voipappz ships extensions only -- every table comes from the
+          # app's rake db:migrate.
+          T=$(docker exec pgedge-test psql -U postgres -d voipappz -t -A -c \
+            "SELECT count(*) FROM pg_tables WHERE schemaname='public';")
+          [ "$T" = "0" ] || { echo "FAIL: voipappz has ${T} tables at init, want 0"; exit 1; }
+          echo "  voipappz tables at init: 0 OK"
+      - name: Verify extensions
+        run: |
+          for ext in hstore uuid-ossp prefix spock; do
+            docker exec pgedge-test psql -U postgres -d voipappz -t -A -c \
+              "SELECT 1 FROM pg_extension WHERE extname='${ext}';" | grep -q 1
+            echo "  voipappz.${ext}: OK"
+          done
+      - name: Verify PostgREST is gone
+        run: |
+          # PostgREST was removed 2026-08-03. Assert it stays removed: no
+          # binary, no listener, no leftover roles holding blanket SELECT.
+          ! docker exec pgedge-test which postgrest 2>/dev/null
+          echo "  postgrest binary absent: OK"
+          ! docker exec pgedge-test curl -sf http://localhost:3000/ >/dev/null 2>&1
+          echo "  :3000 not listening: OK"
+          COUNT=$(docker exec pgedge-test psql -U postgres -d voipappz -t -A -c \
+            "SELECT count(*) FROM pg_roles WHERE rolname IN ('postgrest_anon','postgrest_auth');")
+          [ "$COUNT" = "0" ]
+          echo "  postgrest roles absent: OK"
+      - name: Verify event_store_events is NOT seeded
+        run: |
+          # This image must not create event_store_events. It once did, with a
+          # BIGSERIAL id, which made the API's create_table? migration skip
+          # creation while still recording itself as applied -- leaving the app
+          # on a pre-RubyEventStore schema. The API owns this table.
+          docker exec pgedge-test psql -U postgres -d voipappz -t -A -c \
+            "SELECT to_regclass('public.event_store_events') IS NULL;" | grep -q t
+          echo "  event_store_events not seeded: OK"
+      - name: Verify CIS logging and audit settings
+        run: |
+          check() {
+            ACTUAL=$(docker exec pgedge-test psql -U postgres -t -A -c "SHOW $1;")
+            [ "$ACTUAL" = "$2" ] || { echo "FAIL: $1 is '$ACTUAL', want '$2'"; exit 1; }
+            echo "  $1 = $ACTUAL: OK"
+          }
+          check log_statement ddl
+          check log_connections on
+          check log_disconnections on
+          check log_hostname off
+          check log_truncate_on_rotation on
+          check log_file_mode 0600
+          check log_error_verbosity default
+          check log_min_error_statement error
+          check syslog_sequence_numbers on
+          check syslog_split_messages on
+          check debug_print_parse off
+          check debug_print_rewritten off
+          check debug_print_plan off
+          check debug_pretty_print on
+          check password_encryption scram-sha-256
+
+          docker exec pgedge-test psql -U postgres -t -A -c "SHOW shared_preload_libraries;" \
+            | grep -q pgaudit
+          echo "  pgaudit preloaded: OK"
+          docker exec pgedge-test psql -U postgres -t -A -c "SHOW shared_preload_libraries;" \
+            | grep -q passwordcheck
+          echo "  passwordcheck preloaded: OK"
+          docker exec pgedge-test psql -U postgres -d voipappz -t -A -c \
+            "SELECT 1 FROM pg_extension WHERE extname='pgaudit';" | grep -q 1
+          echo "  pgaudit extension created: OK"
+      - name: Verify DDL replication is enabled (active-active)
+        run: |
+          # Without these, tables the API creates AFTER boot belong to no
+          # replication set and silently never reach the peer node. An older
+          # spock.autoddl_set_enabled() call failed every boot behind 2>/dev/null.
+          check() {
+            ACTUAL=$(docker exec pgedge-test psql -U postgres -t -A -c "SHOW $1;")
+            [ "$ACTUAL" = "$2" ] || { echo "FAIL: $1 is '$ACTUAL', want '$2'"; exit 1; }
+            echo "  $1 = $ACTUAL: OK"
+          }
+          check spock.enable_ddl_replication on
+          check spock.include_ddl_repset on
+          check spock.allow_ddl_from_functions on
+      - name: Verify dump and restore
+        run: |
+          # Helper: drop a database (handles spock replication slots + connections)
+          drop_db() {
+            # Terminate replication workers using slots on this database
+            docker exec pgedge-test psql -U postgres -t -A -c \
+              "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE database='$1' AND active;" 2>/dev/null || true
+            sleep 1
+            # Drop replication slots tied to this database
+            docker exec pgedge-test psql -U postgres -t -A -c \
+              "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE database='$1';" 2>/dev/null || true
+            # Force-drop the database
+            docker exec pgedge-test psql -U postgres -c "DROP DATABASE $1 WITH (FORCE);"
+          }
+
+          # voipappz has no tables at init, so the probe table stands in for
+          # what the API's migrations create.
+          seed() {
+            docker exec pgedge-test psql -U postgres -d voipappz -c \
+              "CREATE TABLE public.ci_dump_probe (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), note text);
+               INSERT INTO public.ci_dump_probe (note) VALUES ('dump-test-row');"
+          }
+          rows() {
+            docker exec pgedge-test psql -U postgres -d voipappz -t -A -c \
+              "SELECT count(*) FROM public.ci_dump_probe WHERE note='dump-test-row';"
+          }
+          recreate() {
+            drop_db voipappz
+            docker exec pgedge-test psql -U postgres -c "CREATE DATABASE voipappz;"
+          }
+          seed
+
+          # ── Custom format (.dump) ──
+          docker exec pgedge-test pg_dump -U postgres -Fc -N spock voipappz > /tmp/voipappz.dump
+          SIZE=$(stat -c%s /tmp/voipappz.dump)
+          [ "$SIZE" -gt 0 ] || (echo "FAIL: custom dump is empty" && exit 1)
+          echo "  Custom dump: ${SIZE} bytes"
+
+          recreate
+          # pg_restore exits non-zero on spock extension stubs; data verification below is the real check
+          docker exec -i pgedge-test pg_restore -U postgres -d voipappz < /tmp/voipappz.dump || true
+          [ "$(rows)" -eq 1 ] || (echo "FAIL: custom restore missing test row" && exit 1)
+          echo "  Custom restore: OK"
+
+          # ── Tar format (.tar) ──
+          docker exec pgedge-test pg_dump -U postgres -Ft -N spock voipappz > /tmp/voipappz.tar
+          recreate
+          docker exec -i pgedge-test pg_restore -U postgres -d voipappz < /tmp/voipappz.tar || true
+          [ "$(rows)" -eq 1 ] || (echo "FAIL: tar restore missing test row" && exit 1)
+          echo "  Tar dump & restore: OK"
+
+          # ── SQL format (.sql) ──
+          docker exec pgedge-test pg_dump -U postgres -N spock voipappz > /tmp/voipappz.sql
+          recreate
+          docker exec -i pgedge-test psql -U postgres -d voipappz < /tmp/voipappz.sql
+          [ "$(rows)" -eq 1 ] || (echo "FAIL: sql restore missing test row" && exit 1)
+          echo "  SQL dump & restore: OK"
+
+          # ── Schema-only and data-only ──
+          docker exec pgedge-test pg_dump -U postgres -Fc -N spock --schema-only voipappz > /tmp/va_schema.dump
+          docker exec pgedge-test pg_dump -U postgres -Fc -N spock --data-only voipappz > /tmp/va_data.dump
+          recreate
+          docker exec -i pgedge-test pg_restore -U postgres -d voipappz < /tmp/va_schema.dump || true
+          docker exec pgedge-test psql -U postgres -d voipappz -t -A -c \
+            "SELECT to_regclass('public.ci_dump_probe') IS NOT NULL;" | grep -q t \
+            || { echo "FAIL: schema-only restore missing table"; exit 1; }
+          [ "$(rows)" -eq 0 ] || (echo "FAIL: schema-only restore carried data" && exit 1)
+          echo "  Schema-only restore: OK"
+          docker exec -i pgedge-test pg_restore -U postgres -d voipappz < /tmp/va_data.dump || true
+          [ "$(rows)" -eq 1 ] || (echo "FAIL: data-only restore missing test row" && exit 1)
+          echo "  Data-only restore: OK"
+
+          docker exec pgedge-test psql -U postgres -d voipappz -c "DROP TABLE public.ci_dump_probe;"
+          echo "  Dump & restore: ALL PASSED"
+      - name: Verify CIS opt-in toggles (TLS, pgcrypto, set_user, revokes, roles, archiving)
+        run: |
+          # Boot a second node with every opt-in CIS knob ON. Passwords must
+          # satisfy passwordcheck (8+ chars, letters AND nonletters) or the
+          # role creation aborts init.
+          docker run -d --name pgedge-cis \
+            -e NODE_NAME=cis -e PEER_NAME=none -e PEER_HOST=localhost \
+            -e DB_USER=postgres -e POSTGRES_PASSWORD=cipassw0rd123 \
+            -e PG_TLS=on \
+            -e PG_PGCRYPTO=on \
+            -e PG_SET_USER=on \
+            -e PG_REVOKE_PUBLIC_CREATE=on \
+            -e PG_REVOKE_FUNCTION_PRIVS=on \
+            -e PG_MONITOR_PASSWORD=cimon1tor123 \
+            -e PG_REPLICATION_PASSWORD=cirepl1cate123 \
+            -e PG_ARCHIVE_MODE=on -e PG_ARCHIVE_COMMAND=/bin/true \
+            ghcr.io/voipappz/db:pgedge
+          for i in $(seq 1 90); do
+            docker exec pgedge-cis test -f /tmp/init-complete 2>/dev/null && echo "ready after ${i}s" && break
+            [ "$i" -eq 90 ] && echo "FAIL: not ready" && docker logs pgedge-cis && exit 1
+            sleep 1
+          done
+
+          check() {
+            A=$(docker exec pgedge-cis psql -U postgres -t -A -c "SHOW $1;")
+            [ "$A" = "$2" ] || { echo "FAIL: $1 is '$A', want '$2'"; exit 1; }
+            echo "  $1 = $A: OK"
+          }
+          check ssl on
+          check ssl_min_protocol_version TLSv1.2
+          check archive_mode on
+          check row_security on
+
+          docker exec pgedge-cis psql -U postgres -t -A -c "SHOW shared_preload_libraries;" \
+            | grep -q set_user || { echo "FAIL: set_user not preloaded"; exit 1; }
+          echo "  set_user preloaded: OK"
+
+          for ext in pgcrypto set_user; do
+            docker exec pgedge-cis psql -U postgres -d voipappz -t -A -c \
+              "SELECT 1 FROM pg_extension WHERE extname='${ext}';" | grep -q 1 \
+              || { echo "FAIL: ${ext} extension missing"; exit 1; }
+            echo "  ${ext} extension: OK"
+          done
+
+          # PUBLIC must not be able to CREATE in schema public (checked via a
+          # fresh role that has no direct grants).
+          docker exec pgedge-cis psql -U postgres -d voipappz -c "CREATE ROLE ci_nobody;" >/dev/null
+          docker exec pgedge-cis psql -U postgres -d voipappz -t -A -c \
+            "SELECT has_schema_privilege('ci_nobody', 'public', 'CREATE');" | grep -q f \
+            || { echo "FAIL: PUBLIC can still CREATE in schema public"; exit 1; }
+          echo "  PUBLIC CREATE revoked: OK"
+
+          # The hardening flag must cover routines already created by the
+          # image's extensions, not only functions created in the future.
+          PUBLIC_ROUTINES=$(docker exec pgedge-cis psql -U postgres -d voipappz -t -A -c \
+            "SELECT count(*) FROM information_schema.role_routine_grants
+             WHERE grantee='PUBLIC'
+               AND routine_schema NOT IN ('pg_catalog','information_schema','spock');")
+          [ "$PUBLIC_ROUTINES" = "0" ] \
+            || { echo "FAIL: ${PUBLIC_ROUTINES} non-system routines remain executable by PUBLIC"; exit 1; }
+          echo "  PUBLIC routine EXECUTE revoked: OK"
+
+          # TLS must be required by pg_hba.conf. A server with ssl=on but
+          # plain `host` rules still accepts unencrypted passwords/data.
+          NON_SSL_RULES=$(docker exec pgedge-cis psql -U postgres -t -A -c \
+            "SELECT count(*) FROM pg_hba_file_rules
+             WHERE type='host'
+               AND address NOT IN ('127.0.0.1','::1');")
+          [ "$NON_SSL_RULES" = "0" ] \
+            || { echo "FAIL: ${NON_SSL_RULES} non-loopback host rules permit plaintext"; exit 1; }
+          # Both probes must carry PGPASSWORD: a network rule is scram, so a
+          # passwordless psql fails before TLS is ever negotiated -- which
+          # would fake a pass on the negative test and a fail on the positive.
+          CIS_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' pgedge-cis)
+          docker exec -e PGPASSWORD=cipassw0rd123 -e PGSSLMODE=require pgedge-cis \
+            psql -h "$CIS_IP" -U postgres -t -A -c \
+            "SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid();" | grep -q t \
+            || { echo "FAIL: encrypted network connection failed"; exit 1; }
+          PLAIN=$(docker exec -e PGPASSWORD=cipassw0rd123 -e PGSSLMODE=disable pgedge-cis \
+            psql -h "$CIS_IP" -U postgres -t -A -c "SELECT 1;" 2>&1) \
+            && { echo "FAIL: unencrypted network connection was accepted"; exit 1; }
+          echo "$PLAIN" | grep -q "no encryption" \
+            || { echo "FAIL: plaintext rejected for the wrong reason: ${PLAIN}"; exit 1; }
+          echo "  TLS required for network clients: OK"
+
+          # Predefined-role monitor login + non-superuser replication role
+          docker exec pgedge-cis psql -U postgres -t -A -c \
+            "SELECT pg_has_role('monitor', 'pg_monitor', 'member');" | grep -q t \
+            || { echo "FAIL: monitor not in pg_monitor"; exit 1; }
+          echo "  monitor role (pg_monitor): OK"
+          docker exec pgedge-cis psql -U postgres -t -A -c \
+            "SELECT rolreplication AND NOT rolsuper FROM pg_roles WHERE rolname='replicator';" | grep -q t \
+            || { echo "FAIL: replicator role wrong"; exit 1; }
+          echo "  replicator role (REPLICATION, not superuser): OK"
+
+          docker rm -f pgedge-cis
+          echo "  CIS opt-in toggles: ALL PASSED"
+      - name: TimescaleDB coexistence and time-series smoke check
+        run: |-
+          docker exec -i pgedge-test psql -U postgres -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE DATABASE timescale_ci;
+          SQL
+          docker exec -i pgedge-test psql -U postgres -d timescale_ci -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE EXTENSION timescaledb;
+          CREATE TABLE samples (at timestamptz NOT NULL, value integer NOT NULL);
+          SELECT create_hypertable('samples', 'at');
+          INSERT INTO samples VALUES ('2026-01-01T00:00:00Z', 2), ('2026-01-01T00:00:30Z', 4);
+          DO $$ BEGIN
+          IF (SELECT avg(value) FROM samples) <> 3 THEN RAISE EXCEPTION 'time-series mismatch'; END IF;
+          END $$;
+          SELECT time_bucket('1 minute', at), avg(value) FROM samples GROUP BY 1;
+          SQL
+      - name: Cleanup
+        if: always()
+        run: docker rm -f pgedge-test pgedge-cis 2>/dev/null || true
+    needs:
+      - build
+  test-multi-node:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: db-image
+          path: /tmp
+      - name: Load candidate image
+        run: docker load -i /tmp/db-image.tar
+      - name: Build and start both nodes
+        run: |
+          # Boot the cluster the way a customer-facing deployment must run:
+          # every CIS knob on, so `make cis-check` below is a real gate and
+          # not a test of a configuration nobody ships. Passwords satisfy
+          # passwordcheck (8+ chars, letters AND nonletters).
+          # printf, not a heredoc: config v2.1 reserves the heredoc operator
+          # as its parameter-interpolation tag and refuses to compile it.
+          printf '%s\n' \
+            'POSTGRES_PASSWORD=testpassword123' \
+            "BACKUP_DIR=${PWD}/backups" \
+            'PG_TLS=on' \
+            'PG_TLS_MIN_PROTOCOL=TLSv1.2' \
+            'PG_LOGGING_COLLECTOR=on' \
+            'PG_SET_USER=on' \
+            'PG_PGCRYPTO=on' \
+            'PG_PASSWORDCHECK=on' \
+            'PG_REVOKE_PUBLIC_CREATE=on' \
+            'PG_REVOKE_FUNCTION_PRIVS=on' \
+            'PG_ROW_SECURITY=on' \
+            'PG_MONITOR_PASSWORD=cimon1tor123' \
+            'PG_REPLICATION_PASSWORD=cirepl1cate123' > .env
+          mkdir -p backups
+          # --profile ci: the second node and pgcat are opt-in now, since a
+          # VoIPAppz install runs one server. This job is the two-node rig.
+          docker compose --profile ci up -d
+      - name: Wait for both nodes
+        run: |
+          for node in pgedge-n1 pgedge-n2; do
+            for i in $(seq 1 180); do
+              docker exec $node test -f /tmp/init-complete 2>/dev/null && echo "${node} ready after ${i}s" && break
+              [ "$i" -eq 180 ] && echo "FAIL: ${node} not ready" && docker compose logs && exit 1
+              sleep 1
+            done
+          done
+      - name: Verify databases on both nodes
+        run: |
+          for node in pgedge-n1 pgedge-n2; do
+            docker exec $node psql -U postgres -t -A -c \
+              "SELECT 1 FROM pg_database WHERE datname='voipappz';" | grep -q 1
+            echo "  ${node}.voipappz: OK"
+
+            for ext in hstore uuid-ossp prefix spock; do
+              docker exec $node psql -U postgres -d voipappz -t -A -c \
+                "SELECT 1 FROM pg_extension WHERE extname='${ext}';" | grep -q 1
+            done
+            echo "  ${node} extensions: OK"
+          done
+      - name: Verify Spock replication
+        run: |
+          # Show subscription-related logs for debugging
+          echo "=== Subscription logs ==="
+          docker compose logs 2>&1 | grep -iE "sub_create|subscription|Peer.*ready|Skipping|WARNING|ERROR" | tail -40
+          echo "==="
+
+          # Check nodes and subscriptions
+          for node in pgedge-n1 pgedge-n2; do
+            docker exec $node psql -U postgres -d voipappz -t -A -c \
+              "SELECT node_name FROM spock.node;" | grep -q "${node##pgedge-}"
+            echo "  ${node} spock node: OK"
+          done
+
+          # Wait for subscriptions (up to 30s)
+          for i in $(seq 1 30); do
+            N1=$(docker exec pgedge-n1 psql -U postgres -d voipappz -t -A -c \
+              "SELECT count(*) FROM spock.subscription;" 2>/dev/null || echo "0")
+            N2=$(docker exec pgedge-n2 psql -U postgres -d voipappz -t -A -c \
+              "SELECT count(*) FROM spock.subscription;" 2>/dev/null || echo "0")
+            [ "$N1" -ge 1 ] && [ "$N2" -ge 1 ] && echo "Subscriptions active after ${i}s" && break
+            [ "$i" -eq 30 ] && echo "WARNING: subscriptions not established"
+            sleep 1
+          done
+
+          # Probe table with a uuid key -- what the API's migrations create.
+          # DDL replication carries it to n2.
+          docker exec pgedge-n1 psql -U postgres -d voipappz -c \
+            "CREATE TABLE public.ci_repl_probe (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), note text);"
+          for i in $(seq 1 30); do
+            docker exec pgedge-n2 psql -U postgres -d voipappz -t -A -c \
+              "SELECT to_regclass('public.ci_repl_probe') IS NOT NULL;" | grep -q t && break
+            [ "$i" -eq 30 ] && echo "FAIL: probe table did not reach n2" && exit 1
+            sleep 1
+          done
+
+          # Test n1 → n2
+          docker exec pgedge-n1 psql -U postgres -d voipappz -c \
+            "INSERT INTO public.ci_repl_probe (note) VALUES ('ci-n1-to-n2');"
+          for i in $(seq 1 15); do
+            docker exec pgedge-n2 psql -U postgres -d voipappz -t -A -c \
+              "SELECT count(*) FROM public.ci_repl_probe WHERE note='ci-n1-to-n2';" | grep -q 1 && echo "  n1→n2: OK" && break
+            [ "$i" -eq 15 ] && echo "FAIL: n1→n2 replication" && exit 1
+            sleep 1
+          done
+
+          # Test n2 → n1
+          docker exec pgedge-n2 psql -U postgres -d voipappz -c \
+            "INSERT INTO public.ci_repl_probe (note) VALUES ('ci-n2-to-n1');"
+          for i in $(seq 1 15); do
+            docker exec pgedge-n1 psql -U postgres -d voipappz -t -A -c \
+              "SELECT count(*) FROM public.ci_repl_probe WHERE note='ci-n2-to-n1';" | grep -q 1 && echo "  n2→n1: OK" && break
+            [ "$i" -eq 15 ] && echo "FAIL: n2→n1 replication" && exit 1
+            sleep 1
+          done
+
+          docker exec pgedge-n1 psql -U postgres -d voipappz -c "DROP TABLE public.ci_repl_probe;"
+      - name: Verify security and tuning
+        run: |
+          # Security
+          ENC=$(docker exec pgedge-n1 psql -U postgres -t -A -c "SHOW password_encryption;")
+          [ "$ENC" = "scram-sha-256" ] || (echo "FAIL: password_encryption=${ENC}" && exit 1)
+          echo "  scram-sha-256: OK"
+
+          docker exec pgedge-n1 psql -U postgres -t -A -c \
+            "SELECT rolpassword FROM pg_authid WHERE rolname='postgres';" | grep -q "^SCRAM-SHA-256"
+          echo "  Password hash: OK"
+
+          HBA=$(docker exec pgedge-n1 cat /etc/postgresql/17/main/pg_hba.conf)
+          echo "$HBA" | grep -q "0.0.0.0/0" && echo "FAIL: 0.0.0.0/0 in pg_hba" && exit 1
+          echo "$HBA" | grep -v "^#" | grep -q "md5" && echo "FAIL: md5 in pg_hba" && exit 1
+          echo "  pg_hba.conf: OK"
+
+          # The full cluster runs hardened: every private-network rule is
+          # hostssl, and Spock's own connections therefore also use TLS.
+          NON_SSL_RULES=$(docker exec pgedge-n1 psql -U postgres -t -A -c \
+            "SELECT count(*) FROM pg_hba_file_rules
+             WHERE type='host'
+               AND address NOT IN ('127.0.0.1','::1');")
+          [ "$NON_SSL_RULES" = "0" ] || { echo "FAIL: plaintext HBA rules=${NON_SSL_RULES}"; exit 1; }
+          echo "  TLS enforced by pg_hba.conf: OK"
+
+          # CIS 7.1: replication must not run as a superuser. Creating the
+          # `replicator` role is not enough -- Spock's subscriptions have to
+          # actually connect as it, or every wal sender is still `postgres`.
+          for node in pgedge-n1 pgedge-n2; do
+            SENDERS=$(docker exec $node psql -U postgres -d voipappz -t -A -c \
+              "SELECT count(*) FROM pg_stat_replication;")
+            [ "$SENDERS" -ge 1 ] \
+              || { echo "FAIL: ${node} has no wal sender to judge"; exit 1; }
+            BAD=$(docker exec $node psql -U postgres -d voipappz -t -A -c \
+              "SELECT count(*) FROM pg_stat_replication s
+               LEFT JOIN pg_roles r ON r.rolname = s.usename
+               WHERE coalesce(r.rolsuper, true) OR NOT coalesce(r.rolreplication, false);")
+            [ "$BAD" = "0" ] \
+              || { echo "FAIL: ${node} has ${BAD} wal sender(s) on a superuser/non-replication role"; exit 1; }
+          done
+          echo "  replication runs as a non-superuser role on both nodes: OK"
+
+          # Password comes from POSTGRES_PASSWORD only -- nothing baked in,
+          # and no secret file the image could fall back to.
+          docker run --rm --entrypoint bash ghcr.io/voipappz/db:pgedge -c \
+            'test ! -f /run/secrets/postgres_password && test ! -f /home/pgedge/.env'
+          ! grep -q "run/secrets" init-node.sh
+          echo "  No secrets, password via env only: OK"
+
+          # Tuning
+          docker exec pgedge-n1 psql -U postgres -t -A -c "
+            SELECT name || '=' || setting FROM pg_settings
+            WHERE name IN (
+              'wal_level','max_connections','shared_buffers',
+              'work_mem','maintenance_work_mem','effective_cache_size',
+              'effective_io_concurrency','random_page_cost',
+              'shared_preload_libraries','password_encryption'
+            ) ORDER BY name;"
+
+          WAL=$(docker exec pgedge-n1 psql -U postgres -t -A -c "SHOW wal_level;")
+          [ "$WAL" = "logical" ] || (echo "FAIL: wal_level=${WAL}" && exit 1)
+
+          CONN=$(docker exec pgedge-n1 psql -U postgres -t -A -c "SHOW max_connections;")
+          [ "$CONN" -ge 250 ] || (echo "FAIL: max_connections=${CONN}" && exit 1)
+
+          LIBS=$(docker exec pgedge-n1 psql -U postgres -t -A -c "SHOW shared_preload_libraries;")
+          echo "$LIBS" | grep -q "spock" || (echo "FAIL: spock not loaded" && exit 1)
+          echo "$LIBS" | grep -q "pg_stat_statements" || (echo "FAIL: pg_stat_statements not loaded" && exit 1)
+          echo "  Tuning: OK"
+      - name: Verify DDL replicates between nodes (active-active)
+        run: |
+          # The real active-active contract: a table created on n1 AFTER boot
+          # must appear on n2 AND be a member of a replication set. This is
+          # exactly the case the API's `rake db:migrate` hits, and it silently
+          # failed while spock DDL replication was off.
+          docker exec pgedge-n1 psql -U postgres -d voipappz -c \
+            "CREATE TABLE ci_ddl_probe (id uuid PRIMARY KEY, note text);"
+
+          FOUND=""
+          for i in $(seq 1 30); do
+            if docker exec pgedge-n2 psql -U postgres -d voipappz -t -A -c \
+                 "SELECT to_regclass('public.ci_ddl_probe') IS NOT NULL;" | grep -q t; then
+              FOUND="yes"; echo "  ci_ddl_probe replicated to n2 after ${i}s"; break
+            fi
+            sleep 1
+          done
+          [ -n "$FOUND" ] || { echo "FAIL: DDL did not replicate to n2"; exit 1; }
+
+          docker exec pgedge-n1 psql -U postgres -d voipappz -t -A -c \
+            "SELECT set_name FROM spock.tables WHERE relname = 'ci_ddl_probe';" | grep -q default
+          echo "  ci_ddl_probe in replication set: OK"
+
+          docker exec pgedge-n1 psql -U postgres -d voipappz -c \
+            "DROP TABLE ci_ddl_probe;"
+      - name: Verify pgcat active-active (spread + write replication)
+        run: |
+          # pgEdge's patched psql probes wire protocol 3.9999, which pgcat
+          # cannot negotiate -- so these checks use a stock postgres:17
+          # client, the same libpq the API uses.
+          psql_via_pgcat() {
+            docker run --rm --network pgedge-net -e PGPASSWORD=testpassword123 \
+              postgres:17-alpine psql -h pgedge-pgcat -U postgres -d voipappz -t -A "$@"
+          }
+
+          # Client-to-pgcat TLS is a separate deployment concern, but the
+          # pgcat-to-PostgreSQL hop must be encrypted when PG_TLS=on.
+          psql_via_pgcat -c \
+            "SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid();" | grep -q t \
+            || { echo "FAIL: pgcat backend connection is not encrypted"; exit 1; }
+          echo "  pgcat backend TLS: OK"
+
+          # default_role="any" + parser off: every transaction lands on a
+          # random node. Ten connections must reach both backends.
+          ADDRS=$(for i in $(seq 1 10); do psql_via_pgcat -c "SELECT inet_server_addr();"; done | sort -u)
+          echo "backend addresses seen:"; echo "$ADDRS"
+          [ "$(echo "$ADDRS" | grep -c .)" -ge 2 ] || { echo "FAIL: pgcat did not spread connections"; exit 1; }
+          echo "  pgcat spreads over both masters: OK"
+
+          # Writes through pgcat land on random nodes; spock must converge
+          # both. uuid keys like the API uses -- a serial PK generates the
+          # same ids on both masters and collides.
+          psql_via_pgcat -c "CREATE TABLE ci_aa_probe (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), born_on inet DEFAULT inet_server_addr());"
+          sleep 3
+          for i in $(seq 1 6); do psql_via_pgcat -q -c "INSERT INTO ci_aa_probe DEFAULT VALUES;"; done
+          sleep 5
+          N1=$(docker exec pgedge-n1 psql -U postgres -d voipappz -t -A -c "SELECT count(*) FROM ci_aa_probe;")
+          N2=$(docker exec pgedge-n2 psql -U postgres -d voipappz -t -A -c "SELECT count(*) FROM ci_aa_probe;")
+          echo "rows seen: n1=$N1 n2=$N2 (inserted 6 via pgcat)"
+          [ "$N1" = "6" ] && [ "$N2" = "6" ] || { echo "FAIL: active-active writes did not converge"; exit 1; }
+          docker exec pgedge-n1 psql -U postgres -d voipappz -c "DROP TABLE ci_aa_probe;"
+          echo "  active-active writes through pgcat converge on both nodes: OK"
+      - name: Verify Makefile export / import / sync
+        run: |
+          # The postgres maintenance DB has no spock node or subscription, so
+          # the probe row can only reach n2 through the sync pipe -- not
+          # through the cluster.
+          docker exec pgedge-n1 psql -U postgres -d postgres -c \
+            "CREATE TABLE public.ci_sync_probe (id int PRIMARY KEY, note text);
+             INSERT INTO public.ci_sync_probe VALUES (1, 'sync-test');"
+
+          make export-db DB=postgres
+          [ -s backups/postgres.dump ] || { echo "FAIL: export produced no file"; exit 1; }
+          echo "  make export-db: OK"
+
+          make sync-db DB=postgres
+          docker exec pgedge-n2 psql -U postgres -d postgres -t -A -c \
+            "SELECT count(*) FROM public.ci_sync_probe;" | grep -q 1
+          echo "  make sync-db n1->n2: OK"
+
+          # Import the export back into n2 -- covers the restore path via make
+          make import-db DB=postgres FILE=backups/postgres.dump NODE=pgedge-n2
+          docker exec pgedge-n2 psql -U postgres -d postgres -t -A -c \
+            "SELECT count(*) FROM public.ci_sync_probe;" | grep -q 1
+          echo "  make import-db: OK"
+
+          # Import from a "remote" host: n2 reached over plain TCP with
+          # password auth -- exactly what a real remote import does.
+          docker exec pgedge-n2 psql -U postgres -d postgres -c \
+            "INSERT INTO public.ci_sync_probe VALUES (2, 'remote-test');"
+          make import-remote DB=postgres NODE=pgedge-n1 \
+            REMOTE_HOST=pgedge-n2 REMOTE_PASSWORD=testpassword123
+          docker exec pgedge-n1 psql -U postgres -d postgres -t -A -c \
+            "SELECT count(*) FROM public.ci_sync_probe WHERE id=2;" | grep -q 1
+          echo "  make import-remote: OK"
+
+          # Dump from a live "remote" (n2 keeps serving throughout)
+          make export-remote DB=postgres NODE=pgedge-n1 DUMP_DIR=./backups-remote \
+            REMOTE_HOST=pgedge-n2 REMOTE_PASSWORD=testpassword123
+          [ -s backups-remote/postgres.dump ] || { echo "FAIL: remote export produced no file"; exit 1; }
+          echo "  make export-remote: OK"
+
+          docker exec pgedge-n1 psql -U postgres -d postgres -c "DROP TABLE public.ci_sync_probe;"
+          docker exec pgedge-n2 psql -U postgres -d postgres -c "DROP TABLE public.ci_sync_probe;"
+      - name: CIS benchmark gate (zero failing controls)
+        run: |
+          # The end-to-end claim: this cluster, as booted above, passes every
+          # automated CIS control. cis-check writes the full evidence and
+          # exits non-zero on any FAIL -- so a regression in any hardening
+          # knob breaks the build here rather than at a customer audit.
+          # REVIEW controls still require human sign-off and do not gate.
+          make cis-check NODE=pgedge-n1 \
+            CUSTOMER_NAME="GitHub Actions" \
+            AUDIT_ENVIRONMENT="CI two-node cluster (${GITHUB_REF_NAME:-local})" \
+            AUDITOR_NAME="GitHub Actions automated run"
+          cp -r reports/cis-postgresql-17 /tmp/ci-cis-report || true
+      - name: Upload /tmp/ci-cis-report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-multi-node-ci-cis-report
+          path: /tmp/ci-cis-report
+          if-no-files-found: ignore
+      - name: Collect container logs
+        if: always()
+        run: |
+          mkdir -p /tmp/ci-logs
+          docker compose logs --no-color > /tmp/ci-logs/compose.log 2>&1 || true
+          docker logs pgedge-pgcat > /tmp/ci-logs/pgcat.log 2>&1 || true
+          # PG_LOGGING_COLLECTOR=on sends server logs to files, not stdout,
+          # so the compose log alone no longer shows what postgres said.
+          for node in pgedge-n1 pgedge-n2; do
+            docker exec "$node" tar cf - -C /var/lib/postgresql/17/main log 2>/dev/null \
+              | tar xf - -C /tmp/ci-logs --transform "s|^log|${node}-log|" 2>/dev/null || true
+          done
+      - name: Upload /tmp/ci-logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-multi-node-ci-logs
+          path: /tmp/ci-logs
+          if-no-files-found: ignore
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v
+    needs:
+      - build
+  publish:
+    runs-on: ubuntu-24.04
+    needs:
+      - build
+      - test
+      - test-multi-node
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: db-image
+          path: /tmp
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish image
+        env:
+          IMAGE: ghcr.io/voipappz/db
+          REVISION: ${{ github.sha }}
+        run: |-
+          docker load -i /tmp/db-image.tar
+          docker tag "$IMAGE:pgedge" "$IMAGE:sha-$REVISION"
+          docker tag "$IMAGE:pgedge" "$IMAGE:latest"
+          docker push "$IMAGE:sha-$REVISION"
+          docker push "$IMAGE:pgedge"
+          docker push "$IMAGE:latest"

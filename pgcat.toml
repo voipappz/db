@@ -1,0 +1,52 @@
+# pgcat for the dev cluster — the SAME pooling layer production runs (../cli),
+# doing the load balancing itself:  client → pgcat (:5435) → n1/n2.
+#
+# Active-active: default_role = "any" round-robins every transaction across
+# ALL servers, and with the query parser off nothing redirects writes — so
+# both spock masters take reads AND writes. The primary/replica labels are
+# routing metadata only (a shard needs exactly one "primary" entry).
+# Known trade-off: pgcat never bans the "primary"-labeled server, so n1
+# failure is retried rather than ejected; n2 failure is banned cleanly.
+#
+# Client caveat: pgEdge's patched psql probes wire protocol 3.9999, which
+# pgcat can't negotiate ("Unexpected startup code: 206607"). Use a stock
+# libpq client (the API's driver is stock) — not psql from inside the nodes.
+#
+# Mounted as a template: pgcat does NOT expand env vars in its TOML, so the
+# compose entrypoint substitutes the password and backend-TLS boolean.
+
+[general]
+host = "0.0.0.0"
+port = 5432
+server_tls = ${PGCAT_SERVER_TLS}
+# The generated development certificate is self-signed. Production should
+# mount a trusted CA/certificate before enabling certificate verification.
+verify_server_certificate = false
+
+connect_timeout = 3000
+healthcheck_timeout = 500
+healthcheck_delay = 10000
+shutdown_timeout = 30000
+ban_time = 30
+
+admin_username = "postgres"
+admin_password = "${POSTGRES_PASSWORD}"
+
+# Only voipappz is pooled, matching production.
+[pools.voipappz]
+pool_mode = "transaction"
+default_role = "any"
+query_parser_enabled = false
+load_balancing_mode = "random"
+
+[pools.voipappz.users.0]
+username = "postgres"
+password = "${POSTGRES_PASSWORD}"
+pool_size = 20
+
+[pools.voipappz.shards.0]
+servers = [
+  ["pgedge-n1", 5432, "primary"],
+  ["pgedge-n2", 5432, "replica"],
+]
+database = "voipappz"

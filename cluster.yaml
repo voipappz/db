@@ -1,0 +1,43 @@
+# pgEdge Multi-Master Cluster Configuration
+# Source of truth for the EU1 + EU2 active-active cluster
+#
+# Usage: This file documents the cluster topology. init-node.sh is driven by
+# environment variables (see .env.example).
+
+cluster_name: voipappz
+pg_version: "17"
+
+database:
+  name: voipappz
+  username: postgres
+  # Password from the POSTGRES_PASSWORD environment variable.
+
+# Replication: all tables via default repset (simple start)
+replication:
+  repset: default
+  # Replicate ALL user tables automatically.
+
+  conflict_resolution: last_update_wins
+
+  autoddl:
+    enabled: true
+    # Automatically replicate DDL changes across nodes.
+    # For manual DDL control, set to false and run DDL on each node.
+
+  # SSL configuration (disabled for now)
+  # ssl:
+  #   mode: require
+  #   ca_file: /certs/ca.crt
+  #   cert_file: /certs/server.crt
+  #   key_file: /certs/server.key
+
+nodes:
+  - name: n1
+    label: EU1
+    host: pgedge-n1
+    port: 5432
+
+  - name: n2
+    label: EU2
+    host: pgedge-n2
+    port: 5432
