@@ -191,6 +191,17 @@ fi
 
 # Configure postgresql.conf for replication (idempotent)
 PG_CONF="/etc/postgresql/${PG_VERSION}/main/postgresql.conf"
+# Reconcile shared_preload_libraries on EVERY boot. The block below is written
+# once, when the config volume is fresh, and a later image cannot append a
+# second copy. An install that booted before TimescaleDB joined this image keeps
+# the old line forever, so `CREATE EXTENSION timescaledb` fails on exactly the
+# nodes an upgrade is meant to reach. Rewrite the line in place when it differs
+# from what this image wants; the fresh-volume path writes the same value.
+if grep -qE "^shared_preload_libraries = " "$PG_CONF" 2>/dev/null \
+   && ! grep -qF "shared_preload_libraries = '${PRELOAD_LIBS}'" "$PG_CONF"; then
+  echo "[$NODE_NAME] Updating shared_preload_libraries to '${PRELOAD_LIBS}'"
+  sed -i -E "s|^shared_preload_libraries = .*|shared_preload_libraries = '${PRELOAD_LIBS}'|" "$PG_CONF"
+fi
 if ! grep -q "pgEdge Spock replication settings" "$PG_CONF" 2>/dev/null; then
 cat >> "$PG_CONF" <<EOF
 # pgEdge Spock replication settings

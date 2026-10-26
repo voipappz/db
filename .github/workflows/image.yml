@@ -85,6 +85,31 @@ jobs:
               "SELECT 1 FROM pg_extension WHERE extname='${ext}';" | grep -q 1
             echo "  voipappz.${ext}: OK"
           done
+      - name: Verify an existing config volume picks up TimescaleDB on restart
+        run: |
+          # postgresql.conf is written once, on a fresh config volume. An install
+          # that booted before TimescaleDB joined this image therefore carries
+          # shared_preload_libraries without it. init-node.sh must rewrite that
+          # line on every boot, or `CREATE EXTENSION timescaledb` fails on the
+          # very nodes an upgrade targets. Simulate the old line, restart the
+          # same container (same volumes), and expect the new one.
+          CONF=/etc/postgresql/17/main/postgresql.conf
+          docker exec pgedge-test sed -i -E \
+            "s|^shared_preload_libraries = .*|shared_preload_libraries = 'spock,pg_stat_statements,pgaudit'|" $CONF
+          docker exec pgedge-test grep -q "^shared_preload_libraries = 'spock,pg_stat_statements,pgaudit'$" $CONF
+          docker restart pgedge-test >/dev/null
+          for i in $(seq 1 90); do
+            docker exec pgedge-test psql -U postgres -d voipappz -c 'SELECT 1' >/dev/null 2>&1 && break
+            [ "$i" -eq 90 ] && echo "FAIL: not back after restart" && docker logs --tail 60 pgedge-test && exit 1
+            sleep 1
+          done
+          docker logs pgedge-test 2>&1 | grep -q "Updating shared_preload_libraries" \
+            || { echo "FAIL: init-node.sh did not report the rewrite"; exit 1; }
+          docker exec pgedge-test psql -U postgres -t -A -c "SHOW shared_preload_libraries;" | grep -q timescaledb \
+            || { echo "FAIL: timescaledb not preloaded after restart"; exit 1; }
+          docker exec pgedge-test psql -U postgres -d voipappz -v ON_ERROR_STOP=1 -c \
+            "CREATE EXTENSION IF NOT EXISTS timescaledb; DROP EXTENSION timescaledb;"
+          echo "  upgraded config volume preloads timescaledb: OK"
       - name: Verify PostgREST is gone
         run: |
           # PostgREST was removed 2026-08-03. Assert it stays removed: no
@@ -671,7 +696,7 @@ jobs:
           if-no-files-found: ignore
       - name: Cleanup
         if: always()
-        run: docker compose down -v
+        run: docker compose --profile ci down -v
     needs:
       - build
   publish:
