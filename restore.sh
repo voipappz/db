@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
 # Restore a backup.sh dump INTO a live database, from inside the container.
+# Same interface as eeshugerman/postgres-backup-s3's restore.sh: no timestamp
+# means the newest, a timestamp names one.
 #
 #   restore.sh --list [DB]           what backup.sh left, locally and in S3
-#   restore.sh DB                    the newest dump of DB (S3 if configured, else local)
-#   restore.sh DB NAME               DB-<stamp>.dump: from $BACKUP_DIR if there, else S3
+#   restore.sh DB                    newest dump of DB (S3 if configured, else local)
+#   restore.sh DB 2026-10-27T03:00:00  that one: $BACKUP_DIR first, then S3
 #   restore.sh DB /path/to/x.dump    a file the container can read
 #
-# pg_restore --clean --if-exists overwrites DB's objects. It exits non-zero on
-# spock extension stubs and on --clean of objects already gone, so the exit
-# code is not the check — the caller verifies the data (see CLAUDE.md).
+# PASSPHRASE decrypts a .dump.gpg object. pg_restore --clean --if-exists
+# overwrites DB's objects; it exits non-zero on spock extension stubs and on
+# --clean of objects already gone, so the exit code is not the check — the
+# caller verifies the data (see CLAUDE.md).
 #
-# An S3 dump is fetched into its own mktemp file, so a scheduled backup.sh
-# running at the same moment can never touch the archive being restored.
+# Upstream fetches into ./db.dump, shared with backup.sh — a scheduled backup
+# landing mid-restore corrupted the archive. Here every fetch is its own mktemp.
 set -euo pipefail
 
 BACKUP_DIR="${BACKUP_DIR:-/backups}"
-S3_PREFIX="${S3_PREFIX:-postgres}"
 DB_USER="${DB_USER:-postgres}"
 
 . "$(dirname "$0")/backup-s3.sh"
@@ -23,40 +25,58 @@ DB_USER="${DB_USER:-postgres}"
 if [ "${1:-}" = "--list" ]; then
   db="${2:-}"
   echo "== $BACKUP_DIR/"
-  ls -lh "$BACKUP_DIR"/${db:+$db-}*.dump 2>/dev/null || echo "   none"
+  ls -lh "$BACKUP_DIR"/${db:+${db}_}*.dump 2>/dev/null || echo "   none"
   if s3_enabled; then
-    echo "== $(s3_path "$db")/"
-    rclone lsl --include '*.dump' "$(s3_path "$db")" | sort -k2,3
+    echo "== $(s3_path)/"
+    rclone lsl --include "${db:-*}_*.dump" --include "${db:-*}_*.dump.gpg" "$(s3_path)" | sort -k4
   fi
   exit 0
 fi
 
-db="${1:?usage: restore.sh DB [NAME|FILE] | --list [DB]}"
+db="${1:?usage: restore.sh DB [TIMESTAMP|FILE] | --list [DB]}"
 want="${2:-}"
 [[ "$db" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]] || { echo "invalid DB name: $db" >&2; exit 2; }
 
-tmp=""
-trap '[ -n "$tmp" ] && rm -f "$tmp"' EXIT
-fetch() { tmp=$(mktemp /tmp/restore-XXXXXX.dump); rclone copyto "$(s3_path "$db/$1")" "$tmp"; src="$tmp"; }
+tmp=$(mktemp -d /tmp/restore-XXXXXX)
+trap 'rm -rf "$tmp"' EXIT
+
+fetch() {  # $1 = object key under the prefix
+  echo "Fetching $(s3_path "$1")..."
+  rclone copyto "$(s3_path "$1")" "$tmp/$1"
+  src="$tmp/$1"
+  if [[ "$src" == *.gpg ]]; then
+    [ -n "${PASSPHRASE:-}" ] || { echo "$1 is encrypted: set PASSPHRASE" >&2; exit 2; }
+    echo "Decrypting backup..."
+    gpg --decrypt --batch --passphrase "$PASSPHRASE" -o "${src%.gpg}" "$src"
+    src="${src%.gpg}"
+  fi
+}
+newest_s3() {
+  rclone lsf --include "${db}_*.dump" --include "${db}_*.dump.gpg" "$(s3_path)" | sort | tail -1
+}
 
 if [ -n "$want" ] && [ -f "$want" ]; then
   src="$want"
-elif [ -n "$want" ] && [ -f "$BACKUP_DIR/$want" ]; then
-  src="$BACKUP_DIR/$want"
+elif [ -n "$want" ] && [ -f "$BACKUP_DIR/${db}_${want}.dump" ]; then
+  src="$BACKUP_DIR/${db}_${want}.dump"
 elif [ -n "$want" ] && s3_enabled; then
-  fetch "$want"
+  key=$(rclone lsf --include "${db}_${want}.dump" --include "${db}_${want}.dump.gpg" "$(s3_path)" | head -1)
+  [ -n "$key" ] || { echo "no ${db}_${want} dump locally or in $(s3_path)" >&2; exit 2; }
+  fetch "$key"
 elif [ -n "$want" ]; then
-  echo "no such dump: $want (not a file, not in $BACKUP_DIR, S3 not configured)" >&2; exit 2
+  echo "no such dump: $want (not a file, not ${db}_${want}.dump in $BACKUP_DIR, S3 not configured)" >&2; exit 2
 elif s3_enabled; then
-  # Names carry a sortable UTC stamp, so the last is the newest.
-  name=$(rclone lsf --include "$db-*.dump" "$(s3_path "$db")" | sort | tail -1)
-  [ -n "$name" ] || { echo "no $db dump in $(s3_path "$db")" >&2; exit 2; }
-  fetch "$name"
+  echo "Finding latest backup..."
+  # Names carry a sortable UTC timestamp, so the last is the newest.
+  key=$(newest_s3)
+  [ -n "$key" ] || { echo "no $db dump in $(s3_path)" >&2; exit 2; }
+  fetch "$key"
 else
-  src=$(ls "$BACKUP_DIR"/"$db"-*.dump 2>/dev/null | sort | tail -1 || true)
+  src=$(ls "$BACKUP_DIR"/"${db}"_*.dump 2>/dev/null | sort | tail -1 || true)
   [ -n "$src" ] || { echo "no $db dump in $BACKUP_DIR" >&2; exit 2; }
 fi
 
 pg_restore --list "$src" >/dev/null
-echo "restoring ${name:-${want:-$src}} -> $db"
+echo "Restoring $(basename "$src") into $db..."
 pg_restore -U "$DB_USER" -d "$db" --clean --if-exists "$src" || true
+echo "Restore complete."
