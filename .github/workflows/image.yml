@@ -362,6 +362,8 @@ jobs:
           END $$;
           SELECT time_bucket('1 minute', at), avg(value) FROM samples GROUP BY 1;
           SQL
+      - name: Verify in-container backup.sh / restore.sh against MinIO
+        run: scripts/test-backup.sh
       - name: Cleanup
         if: always()
         run: docker rm -f pgedge-test pgedge-cis 2>/dev/null || true
