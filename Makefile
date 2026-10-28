@@ -22,7 +22,7 @@ S3_BACKUP_IMAGE := nirlevi/postgres-backup-s3:17
         dump dump-db dump-schema dump-data dump-db-schema dump-db-data \
         restore restore-db \
         export export-db export-remote import import-db import-remote sync sync-db \
-        backup-now backup-ls \
+        backup-now backup-ls backup backup-list backup-restore \
         dump-s3 dump-db-s3 restore-s3 restore-db-s3
 
 # ── Help ─────────────────────────────────────────────────────
@@ -61,6 +61,8 @@ help:
 	@echo ""
 	@echo "Scheduled backups are managed by mothership."
 	@echo "  make backup-now / backup-ls      Manual local backups"
+	@echo "  make backup / backup-list        backup.sh inside NODE (+ S3 when S3_BUCKET is set)"
+	@echo "  make backup-restore FORCE=1 DB=voipappz [NAME=voipappz-<stamp>.dump]"
 	@echo ""
 	@echo "S3 backup (needs S3_* vars in .env):"
 	@echo "  make dump-s3 / restore-s3        All databases"
@@ -441,6 +443,30 @@ backup-now:
 
 backup-ls:
 	@ls -lh $(BACKUP_DIR)/*.dump 2>/dev/null || echo "No dumps in $(BACKUP_DIR)"
+
+# ── In-container backup (backup.sh / restore.sh, baked into the image) ──
+# The same scripts mothership's Ofelia job runs: pg_dump into the node's
+# /backups, then to S3/MinIO when S3_BUCKET is set, pruned on BACKUP_KEEP_DAYS.
+# Root, because /backups is usually a bind dir Docker created root-owned.
+#
+#   make backup                              # dump DATABASES now (+ S3 if set)
+#   make backup-list [DB=voipappz]           # local and S3 dumps
+#   make backup-restore FORCE=1 DB=voipappz [NAME=voipappz-<stamp>.dump]
+_backup_exec = docker exec -u root \
+	-e BACKUP_DATABASES="$(DATABASES)" -e BACKUP_KEEP_DAYS=$(BACKUP_KEEP_DAYS) \
+	-e S3_BUCKET=$(S3_BUCKET) -e S3_ENDPOINT=$(S3_ENDPOINT) -e S3_PREFIX=$(S3_PREFIX) -e S3_REGION=$(S3_REGION) \
+	-e S3_ACCESS_KEY_ID=$(S3_ACCESS_KEY_ID) -e S3_SECRET_ACCESS_KEY=$(S3_SECRET_ACCESS_KEY) \
+	$(NODE) /home/pgedge/scripts
+
+backup:
+	@$(_backup_exec)/backup.sh
+
+backup-list:
+	@$(_backup_exec)/restore.sh --list $(DB)
+
+backup-restore:
+	@[ "$(FORCE)" = "1" ] || { echo "this overwrites $(DB) in $(NODE). FORCE=1 to do it." >&2; exit 2; }
+	@$(_backup_exec)/restore.sh $(DB) $(NAME)
 
 # ── S3 Backup (one-shot via nirlevi/postgres-backup-s3:17) ───
 # Requires S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY in .env

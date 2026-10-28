@@ -65,10 +65,17 @@ RUN (getent group pgedge || groupadd -r pgedge) \
 RUN mkdir -p /etc/postgresql /var/lib/postgresql /var/log/postgresql /var/run/postgresql \
     && chown -R pgedge:pgedge /etc/postgresql /var/lib/postgresql /var/log/postgresql /var/run/postgresql
 
-# Copy per-database SQL init files and node init script
+# rclone uploads backup.sh's dumps to S3/MinIO. From Ubuntu's archive: MinIO
+# stopped publishing mc binaries (dl.min.io answers 410 Gone).
+RUN apt-get update && apt-get install -y --no-install-recommends rclone \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy per-database SQL init files, node init script and the backup scripts
+# (run inside the container: `docker exec -u root <node> .../backup.sh`).
 COPY sql/ /home/pgedge/scripts/sql/
-COPY init-node.sh /home/pgedge/scripts/init-node.sh
-RUN chmod +x /home/pgedge/scripts/init-node.sh \
+COPY init-node.sh backup.sh backup-s3.sh restore.sh /home/pgedge/scripts/
+RUN chmod +x /home/pgedge/scripts/init-node.sh /home/pgedge/scripts/backup.sh /home/pgedge/scripts/restore.sh \
+    && mkdir -p /backups && chown pgedge:pgedge /backups \
     && chown -R pgedge:pgedge /home/pgedge/scripts
 
 EXPOSE 5432
