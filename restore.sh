@@ -8,6 +8,9 @@
 #   restore.sh DB 2026-10-27T03:00:00  that one: $BACKUP_DIR first, then S3
 #   restore.sh DB /path/to/x.dump    a file the container can read
 #
+# Before overwriting, the live DB is dumped to pre-restore_<db>_<ts>.dump (and
+# to S3) — undo a restore with `restore.sh DB /backups/pre-restore_<db>_<ts>.dump`.
+#
 # PASSPHRASE decrypts a .dump.gpg object. pg_restore --clean --if-exists
 # overwrites DB's objects; it exits non-zero on spock extension stubs and on
 # --clean of objects already gone, so the exit code is not the check — the
@@ -25,10 +28,10 @@ DB_USER="${DB_USER:-postgres}"
 if [ "${1:-}" = "--list" ]; then
   db="${2:-}"
   echo "== $BACKUP_DIR/"
-  ls -lh "$BACKUP_DIR"/${db:+${db}_}*.dump 2>/dev/null || echo "   none"
+  ls -lh "$BACKUP_DIR"/${db:+${db}_}*.dump "$BACKUP_DIR"/pre-restore_${db:+${db}_}*.dump 2>/dev/null || echo "   none"
   if s3_enabled; then
     echo "== $(s3_path)/"
-    rclone lsl --include "${db:-*}_*.dump" --include "${db:-*}_*.dump.gpg" "$(s3_path)" | sort -k4
+    rclone lsl --include "${db:-*}_*.dump" --include "${db:-*}_*.dump.gpg" --include "pre-restore_${db:-*}_*.dump" "$(s3_path)" | sort -k4
   fi
   exit 0
 fi
@@ -77,6 +80,21 @@ else
 fi
 
 pg_restore --list "$src" >/dev/null
+
+# Keep what is about to be overwritten. Named pre-restore_<db>_<ts> so "newest
+# <db>_*" never picks it; pruned on the same BACKUP_KEEP_DAYS as backup.sh's.
+# A failed safety dump aborts the restore (set -e).
+safety="$BACKUP_DIR/pre-restore_${db}_$(date -u +%Y-%m-%dT%H:%M:%S).dump"
+echo "Saving current $db to $safety..."
+mkdir -p "$BACKUP_DIR"
+pg_dump -U "$DB_USER" -d "$db" -N spock --format=custom -f "$safety.part"
+pg_restore --list "$safety.part" >/dev/null
+mv "$safety.part" "$safety"
+if s3_enabled; then
+  rclone copyto "$safety" "$(s3_path "$(basename "$safety")")"
+  echo "uploaded: $(s3_path "$(basename "$safety")")"
+fi
+
 echo "Restoring $(basename "$src") into $db..."
 pg_restore -U "$DB_USER" -d "$db" --clean --if-exists "$src" || true
 echo "Restore complete."

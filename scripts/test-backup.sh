@@ -5,6 +5,7 @@
 #   - names are <db>_<YYYY-MM-DDTHH:MM:SS>.dump, the dump is a valid archive
 #     without spock, and no .part is left;
 #   - retention prunes a stale local dump AND a stale S3 object;
+#   - every restore first keeps the existing database as pre-restore_<db>_<ts>.dump;
 #   - restore.sh --list shows both copies.
 #
 #   scripts/test-backup.sh                       # image ghcr.io/voipappz/db:pgedge
@@ -90,6 +91,11 @@ echo ">> restore.sh voipappz (newest, from S3)"
 q voipappz "DROP TABLE backup_probe;" >/dev/null
 run "$SCRIPTS/restore.sh" voipappz 2>&1 | sed 's/^/   /'
 probe "S3 newest restore"
+# The state just before that restore (no backup_probe) was kept, locally and in S3.
+safety=$(docker exec "$PG" sh -c 'ls /backups' | grep '^pre-restore_voipappz_' | sort | tail -1)
+[ -n "$safety" ] || fail "restore did not keep a pre-restore dump of the existing database"
+docker exec "$PG" pg_restore --list "/backups/$safety" | grep -q backup_probe && fail "$safety is not the pre-restore state"
+s3 "rclone lsf s3:backup/postgres" | grep -qx "$safety" || fail "$safety not uploaded"
 
 echo ">> restore.sh voipappz $ts (from S3 by timestamp: local copy removed)"
 run rm "/backups/$name"
