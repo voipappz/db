@@ -28,7 +28,15 @@ q() { docker exec "$PG" psql -U postgres -d "$1" -tAc "$2"; }
 run() { docker exec -u root "${S3_ENV[@]}" -e BACKUP_KEEP_DAYS=1 "$PG" "$@"; }
 # rclone with the remote the scripts configure (backup-s3.sh), not its own.
 s3() { run bash -c ". $SCRIPTS/backup-s3.sh && $*"; }
-probe() { [ "$(q voipappz "SELECT count(*) FROM backup_probe WHERE note='round-trip';")" = 1 ] || fail "row not back after $1"; }
+probe() {
+  [ "$(q voipappz "SELECT count(*) FROM backup_probe WHERE note='round-trip';")" = 1 ] || fail "row not back after $1"
+  [ "$(q voipappz "SELECT count(*) FROM ts_probe;")" = 40 ] || fail "hypertable rows not back after $1"
+  [ "$(q voipappz "SELECT count(*) FROM timescaledb_information.hypertables WHERE hypertable_name='ts_probe';")" = 1 ] || fail "ts_probe is no longer a hypertable after $1"
+  # post_restore ran: the database is out of restoring mode.
+  [ "$(q voipappz "SHOW timescaledb.restoring;")" = off ] || fail "voipappz left in timescaledb restoring mode after $1"
+  docker logs "$PG" 2>&1 | grep -q 'Segmentation fault' && fail "postgres segfaulted during $1"
+  return 0
+}
 
 cleanup() {
   rc=$?
@@ -64,6 +72,12 @@ done
 
 echo ">> a row the dump must carry, and stale dumps the sweep must remove"
 q voipappz "CREATE TABLE backup_probe (id int PRIMARY KEY, note text); INSERT INTO backup_probe VALUES (1, 'round-trip');" >/dev/null
+# A hypertable with chunks: restoring one without timescaledb_pre_restore()
+# segfaulted a real node's postgres. probe() checks these rows come back too.
+q voipappz "CREATE EXTENSION IF NOT EXISTS timescaledb;
+            CREATE TABLE ts_probe (at timestamptz NOT NULL, v int);
+            SELECT create_hypertable('ts_probe', 'at', chunk_time_interval => interval '1 day');
+            INSERT INTO ts_probe SELECT now() - i * interval '6 hours', i FROM generate_series(1, 40) i;" >/dev/null
 run bash -c "touch -d '3 days ago' /backups/$STALE"
 # rclone keeps the file's mtime as object metadata, which --min-age reads.
 s3 "touch -d '3 days ago' /tmp/old.dump && rclone copyto /tmp/old.dump s3:backup/postgres/$STALE"

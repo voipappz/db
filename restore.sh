@@ -28,7 +28,10 @@ DB_USER="${DB_USER:-postgres}"
 if [ "${1:-}" = "--list" ]; then
   db="${2:-}"
   echo "== $BACKUP_DIR/"
-  ls -lh "$BACKUP_DIR"/${db:+${db}_}*.dump "$BACKUP_DIR"/pre-restore_${db:+${db}_}*.dump 2>/dev/null || echo "   none"
+  # One find, not ls of two globs: ls exits 2 when either glob is empty, which
+  # printed "none" under a non-empty listing.
+  found=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "${db:-*}_*.dump" -o -name "pre-restore_${db:-*}_*.dump" \) | sort)
+  if [ -n "$found" ]; then echo "$found" | xargs ls -lh; else echo "   none"; fi
   if s3_enabled; then
     echo "== $(s3_path)/"
     rclone lsl --include "${db:-*}_*.dump" --include "${db:-*}_*.dump.gpg" --include "pre-restore_${db:-*}_*.dump" "$(s3_path)" | sort -k4
@@ -99,6 +102,22 @@ mv "$safety.part" "$safety"
 if s3_enabled; then
   rclone copyto "$safety" "$(s3_path "$(basename "$safety")")"
   echo "uploaded: $(s3_path "$(basename "$safety")")"
+fi
+
+# TimescaleDB: a plain pg_restore of hypertable chunks segfaults the backend
+# and takes the whole server through crash recovery (seen on a real voipappz
+# dump: COPY _timescaledb_internal._hyper_1_1_chunk). The documented sequence
+# is timescaledb_pre_restore() before and timescaledb_post_restore() after;
+# post_restore runs from the trap too, so a failed restore never leaves the
+# database in restoring mode with its background workers stopped.
+psql_db() { psql -U "$DB_USER" -d "$db" -v ON_ERROR_STOP=1 -qtAc "$1"; }
+timescale=""
+if pg_restore --list "$src" | grep -qE ' EXTENSION - timescaledb( |$)'; then
+  timescale=1
+  psql_db "CREATE EXTENSION IF NOT EXISTS timescaledb" >/dev/null
+  psql_db "SELECT timescaledb_pre_restore()" >/dev/null
+  trap 'psql_db "SELECT timescaledb_post_restore()" >/dev/null || echo "timescaledb_post_restore() FAILED on $db: run it by hand" >&2; rm -rf "$tmp"' EXIT
+  echo "TimescaleDB: pre_restore done; post_restore runs when this exits"
 fi
 
 echo "Restoring $(basename "$src") into $db..."
