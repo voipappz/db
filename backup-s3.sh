@@ -16,3 +16,11 @@ export RCLONE_S3_NO_CHECK_BUCKET=true
 
 s3_enabled() { [ -n "${S3_BUCKET:-}" ]; }
 s3_path() { echo "s3:${S3_BUCKET}/${S3_PREFIX:-postgres}${1:+/$1}"; }
+
+# backup.sh and restore.sh run one at a time per container: a scheduled backup
+# must not dump a database mid-swap, nor two restores race. Held until exit.
+backup_lock() {
+  exec 9>>/tmp/va-backup.lock
+  chmod 666 /tmp/va-backup.lock 2>/dev/null || true
+  flock -w "${BACKUP_LOCK_WAIT:-3600}" 9 || { echo "another backup/restore still holds /tmp/va-backup.lock" >&2; exit 1; }
+}
