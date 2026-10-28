@@ -62,7 +62,7 @@ help:
 	@echo "Scheduled backups are managed by mothership."
 	@echo "  make backup-now / backup-ls      Manual local backups"
 	@echo "  make backup / backup-list        backup.sh inside NODE (+ S3 when S3_BUCKET is set)"
-	@echo "  make backup-restore FORCE=1 DB=voipappz [NAME=voipappz-<stamp>.dump]"
+	@echo "  make backup-restore FORCE=1 DB=voipappz [TS=2026-10-27T03:00:00]"
 	@echo ""
 	@echo "S3 backup (needs S3_* vars in .env):"
 	@echo "  make dump-s3 / restore-s3        All databases"
@@ -451,12 +451,16 @@ backup-ls:
 #
 #   make backup                              # dump DATABASES now (+ S3 if set)
 #   make backup-list [DB=voipappz]           # local and S3 dumps
-#   make backup-restore FORCE=1 DB=voipappz [NAME=voipappz-<stamp>.dump]
+#   make backup-restore FORCE=1 DB=voipappz [TS=2026-10-27T03:00:00]
+# TS only from the command line or .env: a stray environment variable (WSL
+# exports NAME=<hostname>, which is why this is not NAME=) must not pick a dump.
 _backup_exec = docker exec -u root \
 	-e BACKUP_DATABASES="$(DATABASES)" -e BACKUP_KEEP_DAYS=$(BACKUP_KEEP_DAYS) \
 	-e S3_BUCKET=$(S3_BUCKET) -e S3_ENDPOINT=$(S3_ENDPOINT) -e S3_PREFIX=$(S3_PREFIX) -e S3_REGION=$(S3_REGION) \
 	-e S3_ACCESS_KEY_ID=$(S3_ACCESS_KEY_ID) -e S3_SECRET_ACCESS_KEY=$(S3_SECRET_ACCESS_KEY) \
+	-e PASSPHRASE=$(BACKUP_PASSPHRASE) \
 	$(NODE) /home/pgedge/scripts
+_backup_ts = $(if $(filter environment%,$(origin TS)),,$(TS))
 
 backup:
 	@$(_backup_exec)/backup.sh
@@ -466,7 +470,7 @@ backup-list:
 
 backup-restore:
 	@[ "$(FORCE)" = "1" ] || { echo "this overwrites $(DB) in $(NODE). FORCE=1 to do it." >&2; exit 2; }
-	@$(_backup_exec)/restore.sh $(DB) $(NAME)
+	@$(_backup_exec)/restore.sh $(DB) $(_backup_ts)
 
 # ── S3 Backup (one-shot via nirlevi/postgres-backup-s3:17) ───
 # Requires S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY in .env
