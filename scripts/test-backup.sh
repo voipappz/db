@@ -122,4 +122,30 @@ q voipappz "DROP TABLE backup_probe;" >/dev/null
 docker exec -u root "$PG" "$SCRIPTS/restore.sh" voipappz "$lts" 2>&1 | sed 's/^/   /'
 probe "local restore"
 
-echo "PASS: dated dumps locally and in MinIO (plain and gpg), both pruned; restore by newest, timestamp, local"
+echo ">> the Makefile: make backup / backup-list / backup-restore drive the same scripts"
+# Every S3 value on the command line, so a local .env (which the Makefile
+# -includes) cannot point this at a real bucket.
+mk() { make -s -C "$(dirname "$0")/.." "$@" NODE="$PG" DATABASES=voipappz BACKUP_KEEP_DAYS=1 \
+  S3_BUCKET=backup S3_ENDPOINT="http://$MI:9000" S3_PREFIX=postgres S3_REGION=us-east-1 \
+  S3_ACCESS_KEY_ID=backuptest S3_SECRET_ACCESS_KEY=backuptest-secret-2026; }
+before=$(s3 "rclone lsf --include 'voipappz_*.dump' s3:backup/postgres" | sort | tail -1)
+sleep 1   # names are per-second; the make run must produce a new one
+mk backup | sed 's/^/   /'
+made=$(s3 "rclone lsf --include 'voipappz_*.dump' s3:backup/postgres" | sort | tail -1)
+[ -n "$made" ] && [ "$made" != "$before" ] || fail "make backup uploaded nothing new (newest: $made)"
+listed=$(mk backup-list DB=voipappz)   # not piped into grep -q: SIGPIPE + pipefail
+echo "$listed" | grep -q "$made" || fail "make backup-list does not show $made"
+mk backup-restore DB=voipappz 2>/dev/null && fail "make backup-restore ran without FORCE=1"
+q voipappz "DROP TABLE backup_probe;" >/dev/null
+# A TS in the environment must not choose the dump (WSL exports NAME this way).
+TS=bogus mk backup-restore FORCE=1 DB=voipappz 2>&1 | sed 's/^/   /'
+probe "make backup-restore (newest, TS only in env)"
+mts=${made#voipappz_}; mts=${mts%.dump}
+q voipappz "DROP TABLE backup_probe;" >/dev/null
+mk backup-restore FORCE=1 DB=voipappz TS="$mts" 2>&1 | sed 's/^/   /'
+probe "make backup-restore TS=<timestamp>"
+# Three restores ran within seconds above; each must have its own safety copy.
+n_safe=$(docker exec "$PG" sh -c 'ls /backups' | grep -c '^pre-restore_voipappz_')
+[ "$n_safe" -ge 6 ] || fail "only $n_safe pre-restore dumps for 6 restores: one overwrote another"
+
+echo "PASS: dated dumps locally and in MinIO (plain and gpg), both pruned; restore by newest, timestamp, local; make targets"

@@ -84,7 +84,13 @@ pg_restore --list "$src" >/dev/null
 # Keep what is about to be overwritten. Named pre-restore_<db>_<ts> so "newest
 # <db>_*" never picks it; pruned on the same BACKUP_KEEP_DAYS as backup.sh's.
 # A failed safety dump aborts the restore (set -e).
+# Names are per-second: two restores in one second must not share (and so
+# overwrite) one safety copy.
 safety="$BACKUP_DIR/pre-restore_${db}_$(date -u +%Y-%m-%dT%H:%M:%S).dump"
+while [ -e "$safety" ]; do
+  sleep 1
+  safety="$BACKUP_DIR/pre-restore_${db}_$(date -u +%Y-%m-%dT%H:%M:%S).dump"
+done
 echo "Saving current $db to $safety..."
 mkdir -p "$BACKUP_DIR"
 pg_dump -U "$DB_USER" -d "$db" -N spock --format=custom -f "$safety.part"
