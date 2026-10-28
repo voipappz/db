@@ -22,7 +22,7 @@
 # objects upstream already wrote stay restorable.
 #
 # Dumps exclude spock (-N spock): its metadata is rebuilt, never restored.
-# Each dump is written as .part, validated with pg_restore --list, then renamed,
+# Each dump is written to a unique .part, validated with pg_restore --list, then renamed,
 # so a half-written file never looks like the newest good backup.
 set -euo pipefail
 
@@ -36,16 +36,24 @@ DB_USER="${DB_USER:-postgres}"
 
 . "$(dirname "$0")/backup-s3.sh"
 
+backup_lock   # backup-s3.sh: one backup/restore at a time
 mkdir -p "$BACKUP_DIR"
-rm -f "$BACKUP_DIR"/*.dump.part
+# Only a crashed run's leftovers: a fresh .part may be another run's work.
+find "$BACKUP_DIR" -maxdepth 1 -name '*.part' -mmin +1440 -delete
 
 timestamp=$(date -u +%Y-%m-%dT%H:%M:%S)
+# Names are per-second; never reuse one a previous run in this second took.
+while ls "$BACKUP_DIR"/*_"$timestamp".dump >/dev/null 2>&1; do
+  sleep 1; timestamp=$(date -u +%Y-%m-%dT%H:%M:%S)
+done
 for db in $BACKUP_DATABASES; do
   echo "Creating backup of $db database..."
   final="$BACKUP_DIR/${db}_${timestamp}.dump"
-  pg_dump -U "$DB_USER" -d "$db" -N spock --format=custom -f "$final.part"
-  pg_restore --list "$final.part" >/dev/null
-  mv "$final.part" "$final"
+  part=$(mktemp "$final.XXXXXX.part")
+  chmod 644 "$part"   # mktemp makes it 600; dumps stay readable as before
+  pg_dump -U "$DB_USER" -d "$db" -N spock --format=custom -f "$part"
+  pg_restore --list "$part" >/dev/null
+  mv "$part" "$final"
   echo "backup ready: $final ($(du -h "$final" | cut -f1))"
 
   if s3_enabled; then
